@@ -79,6 +79,29 @@ func AddRateLimitCookie(cookie string, expirationTime time.Time) {
 	//fmt.Printf("Storing cookie: %s with value: %+v\n", cookie, RateLimitCookie{ExpirationTime: expirationTime})
 }
 
+func getAvailableCookiesSnapshot(now time.Time) []string {
+	cookies := GetGSCookies()
+	available := make([]string, 0, len(cookies))
+	for _, cookie := range cookies {
+		cookie = strings.TrimSpace(cookie)
+		if cookie == "" {
+			continue
+		}
+		if value, ok := rateLimitCookies.Load(cookie); ok {
+			rateLimitCookie, ok := value.(RateLimitCookie)
+			if !ok {
+				continue
+			}
+			if rateLimitCookie.ExpirationTime.After(now) {
+				continue
+			}
+			rateLimitCookies.Delete(cookie)
+		}
+		available = append(available, cookie)
+	}
+	return available
+}
+
 type CookieManager struct {
 	Cookies      []string
 	currentIndex int
@@ -116,24 +139,21 @@ func RemoveCookie(cookieToRemove string) {
 	cookiesMutex.Lock()
 	defer cookiesMutex.Unlock()
 
-	// 创建一个新的切片，过滤掉需要删除的 cookie
-	var newCookies []string
-	for _, cookie := range GetGSCookies() {
+	newCookies := make([]string, 0, len(GSCookies))
+	for _, cookie := range GSCookies {
 		if cookie != cookieToRemove {
 			newCookies = append(newCookies, cookie)
 		}
 	}
 
-	// 更新 GSCookies
 	GSCookies = newCookies
 }
 
 // GetGSCookies 获取 GSCookies 的副本
 func GetGSCookies() []string {
-	//cookiesMutex.Lock()
-	//defer cookiesMutex.Unlock()
+	cookiesMutex.Lock()
+	defer cookiesMutex.Unlock()
 
-	// 返回 GSCookies 的副本，避免外部直接修改
 	cookiesCopy := make([]string, len(GSCookies))
 	copy(cookiesCopy, GSCookies)
 	return cookiesCopy
@@ -141,35 +161,8 @@ func GetGSCookies() []string {
 
 // NewCookieManager 创建 CookieManager
 func NewCookieManager() *CookieManager {
-	var validCookies []string
-	// 遍历 GSCookies
-	for _, cookie := range GetGSCookies() {
-		cookie = strings.TrimSpace(cookie)
-		if cookie == "" {
-			continue // 忽略空字符串
-		}
-
-		// 检查是否在 RateLimitCookies 中
-		if value, ok := rateLimitCookies.Load(cookie); ok {
-			rateLimitCookie, ok := value.(RateLimitCookie) // 正确转换为 RateLimitCookie
-			if !ok {
-				continue
-			}
-			if rateLimitCookie.ExpirationTime.After(time.Now()) {
-				// 如果未过期，忽略该 cookie
-				continue
-			} else {
-				// 如果已过期，从 RateLimitCookies 中删除
-				rateLimitCookies.Delete(cookie)
-			}
-		}
-
-		// 添加到有效 cookie 列表
-		validCookies = append(validCookies, cookie)
-	}
-
 	return &CookieManager{
-		Cookies:      validCookies,
+		Cookies:      getAvailableCookiesSnapshot(time.Now()),
 		currentIndex: 0,
 	}
 }
@@ -241,6 +234,12 @@ func (cm *CookieManager) GetRandomCookie() (string, error) {
 	cm.currentIndex = randomIndex
 
 	return cm.Cookies[randomIndex], nil
+}
+
+func (cm *CookieManager) Len() int {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return len(cm.Cookies)
 }
 
 // SessionKey 定义复合键结构

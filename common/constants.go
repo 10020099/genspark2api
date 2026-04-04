@@ -2,14 +2,38 @@ package common
 
 import "time"
 
+func sliceToSet(items []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		set[item] = struct{}{}
+	}
+	return set
+}
+
+func IsTextModel(model string) bool {
+	_, ok := TextModelSet[model]
+	return ok
+}
+
+func IsImageModel(model string) bool {
+	_, ok := ImageModelSet[model]
+	return ok
+}
+
+func IsVideoModel(model string) bool {
+	_, ok := VideoModelSet[model]
+	return ok
+}
+
 var StartTime = time.Now().Unix() // unit: second
 
 var Version = "v1.12.6" // this hard coding will be replaced automatically when building, no need to manually change
 
 var DefaultOpenaiModelList = []string{
-	"gpt-5-pro",
+	"gpt-5.4-pro",
 	"gpt-5.1-low",
 	"gpt-5.2",
+	"gpt-5.4",
 	"gpt-5.2-pro",
 	"o3-pro",
 	"claude-sonnet-4-6",
@@ -60,9 +84,10 @@ var DefaultOpenaiModelList = []string{
 }
 
 var TextModelList = []string{
-	"gpt-5-pro",
+	"gpt-5.4-pro",
 	"gpt-5.1-low",
 	"gpt-5.2",
+	"gpt-5.4",
 	"gpt-5.2-pro",
 	"o3-pro",
 	"claude-sonnet-4-6",
@@ -121,5 +146,9 @@ var VideoModelList = []string{
 	"runway/gen4_turbo",
 	"fal-ai/bytedance-upscaler/upscale/video",
 }
+
+var TextModelSet = sliceToSet(TextModelList)
+var ImageModelSet = sliceToSet(ImageModelList)
+var VideoModelSet = sliceToSet(VideoModelList)
 
 //

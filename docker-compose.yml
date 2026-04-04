@@ -2,7 +2,7 @@ version: '3.4'
 
 services:
   genspark2api:
-    image: deanxv/genspark2api:latest
+    image: ghcr.io/10020099/genspark2api:latest
     container_name: genspark2api
     restart: always
     ports:

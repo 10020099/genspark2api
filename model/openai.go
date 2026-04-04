@@ -3,10 +3,35 @@ package model
 import "encoding/json"
 
 type OpenAIChatCompletionRequest struct {
-	Model    string              `json:"model"`
-	Stream   bool                `json:"stream"`
-	Messages []OpenAIChatMessage `json:"messages"`
+	Model      string              `json:"model"`
+	Stream     bool                `json:"stream"`
+	Messages   []OpenAIChatMessage `json:"messages"`
+	Tools      []OpenAITool        `json:"tools,omitempty"`
+	ToolChoice interface{}         `json:"tool_choice,omitempty"`
 	OpenAIChatCompletionExtraRequest
+}
+
+type OpenAITool struct {
+	Type     string         `json:"type"`
+	Function OpenAIFunction `json:"function"`
+}
+
+type OpenAIFunction struct {
+	Name        string      `json:"name"`
+	Description string      `json:"description,omitempty"`
+	Parameters  interface{} `json:"parameters,omitempty"`
+}
+
+type OpenAIToolCall struct {
+	Index    int                    `json:"index"`
+	ID       string                 `json:"id"`
+	Type     string                 `json:"type"`
+	Function OpenAIToolCallFunction `json:"function"`
+}
+
+type OpenAIToolCallFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
 }
 
 type OpenAIChatCompletionExtraRequest struct {
@@ -20,10 +45,12 @@ type SessionState struct {
 	AnswerIsFinished bool     `json:"answer_is_finished"`
 }
 type OpenAIChatMessage struct {
-	Role         string        `json:"role"`
-	Content      interface{}   `json:"content"`
-	IsPrompt     bool          `json:"is_prompt"`
-	SessionState *SessionState `json:"session_state"`
+	Role         string             `json:"role"`
+	Content      interface{}        `json:"content"`
+	ToolCallID   string             `json:"tool_call_id,omitempty"`
+	ToolCalls    []OpenAIToolCall   `json:"tool_calls,omitempty"`
+	IsPrompt     bool               `json:"is_prompt"`
+	SessionState *SessionState      `json:"session_state"`
 }
 
 func (r *OpenAIChatCompletionRequest) AddMessage(message OpenAIChatMessage) {
@@ -108,16 +135,18 @@ type OpenAIChatCompletionResponse struct {
 }
 
 type OpenAIChoice struct {
-	Index        int           `json:"index"`
-	Message      OpenAIMessage `json:"message"`
-	LogProbs     *string       `json:"logprobs"`
-	FinishReason *string       `json:"finish_reason"`
-	Delta        OpenAIDelta   `json:"delta"`
+	Index        int              `json:"index"`
+	Message      OpenAIMessage    `json:"message"`
+	LogProbs     *string          `json:"logprobs"`
+	FinishReason *string          `json:"finish_reason"`
+	Delta        OpenAIDelta      `json:"delta"`
+	ToolCalls    []OpenAIToolCall `json:"tool_calls,omitempty"`
 }
 
 type OpenAIMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role      string           `json:"role"`
+	Content   string           `json:"content,omitempty"`
+	ToolCalls []OpenAIToolCall `json:"tool_calls,omitempty"`
 }
 
 type OpenAIUsage struct {
@@ -127,8 +156,9 @@ type OpenAIUsage struct {
 }
 
 type OpenAIDelta struct {
-	Content string `json:"content"`
-	Role    string `json:"role"`
+	Content   string           `json:"content,omitempty"`
+	Role      string           `json:"role,omitempty"`
+	ToolCalls []OpenAIToolCall `json:"tool_calls,omitempty"`
 }
 
 type OpenAIImagesGenerationRequest struct {

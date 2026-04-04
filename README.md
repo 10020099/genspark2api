@@ -103,7 +103,7 @@ version: '3.4'
 
 services:
   genspark2api:
-    image: deanxv/genspark2api:latest
+    image: ghcr.io/10020099/genspark2api:latest
     container_name: genspark2api
     restart: always
     ports:
@@ -125,13 +125,13 @@ docker run --name genspark2api -d --restart always \
 -e GS_COOKIE=***** \
 -e API_SECRET="123456" \
 -e TZ=Asia/Shanghai \
-deanxv/genspark2api
+ghcr.io/10020099/genspark2api
 ```
 
 其中`API_SECRET`、`GS_COOKIE`修改为自己的。
 
-如果上面的镜像无法拉取,可以尝试使用 GitHub 的 Docker 镜像,将上面的`deanxv/genspark2api`替换为
-`ghcr.io/deanxv/genspark2api`即可。
+如果上面的镜像无法拉取,可以尝试使用 GitHub 的 Docker 镜像,使用
+`ghcr.io/10020099/genspark2api`即可。
 
 ### 部署到第三方平台
 

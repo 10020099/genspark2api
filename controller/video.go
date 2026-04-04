@@ -11,7 +11,6 @@ import (
 	"genspark2api/model"
 	"github.com/deanxv/CycleTLS/cycletls"
 	"github.com/gin-gonic/gin"
-	"github.com/samber/lo"
 	"io"
 	"net/http"
 	"strings"
@@ -29,7 +28,7 @@ func VideosForOpenAI(c *gin.Context) {
 		return
 	}
 
-	if lo.Contains(common.VideoModelList, openAIReq.Model) == false {
+	if !common.IsVideoModel(openAIReq.Model) {
 		c.JSON(400, gin.H{"error": "Invalid model"})
 		return
 	}
@@ -70,7 +69,7 @@ func VideoProcess(c *gin.Context, client cycletls.CycleTLS, openAIReq model.Vide
 	// Initialize session manager and get initial cookie
 	if len(config.SessionImageChatMap) == 0 {
 		//logger.Warnf(ctx, "未配置环境变量 SESSION_IMAGE_CHAT_MAP, 可能会生图失败!")
-		maxRetries = len(cookieManager.Cookies)
+		maxRetries = cookieManager.Len()
 
 		var err error
 		cookie, err = cookieManager.GetRandomCookie()

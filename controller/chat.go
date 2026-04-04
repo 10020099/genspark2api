@@ -12,10 +12,10 @@ import (
 	"genspark2api/model"
 	"github.com/deanxv/CycleTLS/cycletls"
 	"github.com/gin-gonic/gin"
-	"github.com/samber/lo"
+	"github.com/google/uuid"
 	"io"
-	"io/ioutil"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -23,6 +23,8 @@ import (
 const (
 	errNoValidCookies = "No valid cookies available"
 )
+
+var sharedDownloadClient = &http.Client{Timeout: 30 * time.Second}
 
 const (
 	baseURL          = "https://www.genspark.ai"
@@ -78,7 +80,7 @@ func ChatForOpenAI(c *gin.Context) {
 		return
 	}
 
-	if lo.Contains(common.ImageModelList, openAIReq.Model) {
+	if common.IsImageModel(openAIReq.Model) {
 		responseId := fmt.Sprintf(responseIDFormat, time.Now().Format("20060102150405"))
 
 		if len(openAIReq.GetUserContent()) == 0 {
@@ -122,7 +124,7 @@ func ChatForOpenAI(c *gin.Context) {
 			}
 
 			if openAIReq.Stream {
-				streamResp := createStreamResponse(responseId, openAIReq.Model, jsonData, model.OpenAIDelta{Content: strings.Join(content, "\n"), Role: "assistant"}, nil)
+				streamResp := createStreamResponse(responseId, openAIReq.Model, streamUsage{promptTokens: common.CountTokenText(string(jsonData), openAIReq.Model)}, model.OpenAIDelta{Content: strings.Join(content, "\n"), Role: "assistant"}, nil)
 				err := sendSSEvent(c, streamResp)
 				if err != nil {
 					logger.Errorf(c.Request.Context(), err.Error())
@@ -191,9 +193,9 @@ func ChatForOpenAI(c *gin.Context) {
 	//}
 
 	if openAIReq.Stream {
-		handleStreamRequest(c, client, cookie, cookieManager, requestBody, openAIReq.Model, isSearchModel)
+		handleStreamRequest(c, client, cookie, cookieManager, requestBody, openAIReq.Model, isSearchModel, len(openAIReq.Tools) > 0)
 	} else {
-		handleNonStreamRequest(c, client, cookie, cookieManager, requestBody, openAIReq.Model, isSearchModel)
+		handleNonStreamRequest(c, client, cookie, cookieManager, requestBody, openAIReq.Model, isSearchModel, len(openAIReq.Tools) > 0)
 	}
 
 }
@@ -326,16 +328,136 @@ func processBytes(c *gin.Context, client cycletls.CycleTLS, cookie string, bytes
 
 // 获取文件字节数组的函数
 func fetchImageBytes(url string) ([]byte, error) {
-	resp, err := http.Get(url)
+	resp, err := sharedDownloadClient.Get(url)
 	if err != nil {
 		return nil, fmt.Errorf("http.Get err: %v\n", err)
 	}
 	defer resp.Body.Close()
 
-	return ioutil.ReadAll(resp.Body)
+	return io.ReadAll(resp.Body)
+}
+
+var toolCallPattern = regexp.MustCompile(`(?s)<tool_call>\s*(\{.*?\})\s*</tool_call>`)
+
+type parsedToolCall struct {
+	Name      string          `json:"name"`
+	Arguments json.RawMessage `json:"arguments"`
+}
+
+func buildToolSystemPrompt(tools []model.OpenAITool) (string, error) {
+	if len(tools) == 0 {
+		return "", nil
+	}
+
+	toolJSON, err := json.Marshal(tools)
+	if err != nil {
+		return "", err
+	}
+
+	return strings.TrimSpace(fmt.Sprintf(`You can call external tools.
+
+Available tools:
+%s
+
+When a tool is needed, respond with one or more tool calls using exactly this XML-wrapped JSON format and no extra commentary:
+<tool_call>{"name":"tool_name","arguments":{"key":"value"}}</tool_call>
+
+Rules:
+1. The JSON inside each <tool_call> must be valid JSON.
+2. Use the exact tool name from the provided tools.
+3. Put all function arguments inside the arguments object.
+4. If no tool is needed, answer normally.
+5. If multiple tools are needed, output multiple <tool_call>...</tool_call> blocks.`, string(toolJSON))), nil
+}
+
+func normalizeToolArguments(raw json.RawMessage) string {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return "{}"
+	}
+	return trimmed
+}
+
+func extractToolCalls(content string) ([]model.OpenAIToolCall, string, bool) {
+	matches := toolCallPattern.FindAllStringSubmatch(content, -1)
+	if len(matches) == 0 {
+		return nil, strings.TrimSpace(content), false
+	}
+
+	toolCalls := make([]model.OpenAIToolCall, 0, len(matches))
+	for index, match := range matches {
+		if len(match) < 2 {
+			continue
+		}
+
+		var parsed parsedToolCall
+		if err := json.Unmarshal([]byte(match[1]), &parsed); err != nil {
+			return nil, strings.TrimSpace(content), false
+		}
+
+		if strings.TrimSpace(parsed.Name) == "" {
+			return nil, strings.TrimSpace(content), false
+		}
+
+		toolIndex := index
+		toolCalls = append(toolCalls, model.OpenAIToolCall{
+			Index: toolIndex,
+			ID:    "call_" + strings.ReplaceAll(uuid.NewString(), "-", ""),
+			Type:  "function",
+			Function: model.OpenAIToolCallFunction{
+				Name:      parsed.Name,
+				Arguments: normalizeToolArguments(parsed.Arguments),
+			},
+		})
+	}
+
+	remaining := strings.TrimSpace(toolCallPattern.ReplaceAllString(content, ""))
+	return toolCalls, remaining, len(toolCalls) > 0
+}
+
+func preprocessToolMessages(openAIReq *model.OpenAIChatCompletionRequest) error {
+	if len(openAIReq.Tools) > 0 {
+		toolPrompt, err := buildToolSystemPrompt(openAIReq.Tools)
+		if err != nil {
+			return err
+		}
+		openAIReq.AddMessage(model.OpenAIChatMessage{
+			Role:    "system",
+			Content: toolPrompt,
+		})
+	}
+
+	for i := range openAIReq.Messages {
+		message := &openAIReq.Messages[i]
+		switch message.Role {
+		case "tool":
+			message.Role = "user"
+			if content, ok := message.Content.(string); ok {
+				message.Content = fmt.Sprintf("Tool result (tool_call_id=%s):\n%s", message.ToolCallID, content)
+			}
+		case "assistant":
+			if len(message.ToolCalls) > 0 {
+				toolCallsJSON, err := json.Marshal(message.ToolCalls)
+				if err != nil {
+					return err
+				}
+				prefix := fmt.Sprintf("Assistant tool calls:\n%s", string(toolCallsJSON))
+				if content, ok := message.Content.(string); ok && strings.TrimSpace(content) != "" {
+					message.Content = prefix + "\n\n" + content
+				} else {
+					message.Content = prefix
+				}
+			}
+		}
+	}
+
+	return nil
 }
 
 func createRequestBody(c *gin.Context, client cycletls.CycleTLS, cookie string, openAIReq *model.OpenAIChatCompletionRequest) (map[string]interface{}, error) {
+	if err := preprocessToolMessages(openAIReq); err != nil {
+		return nil, fmt.Errorf("preprocessToolMessages err: %v", err)
+	}
 	openAIReq.SystemMessagesProcess(openAIReq.Model)
 	if config.PRE_MESSAGES_JSON != "" {
 		err := openAIReq.PrependMessagesFromJSON(config.PRE_MESSAGES_JSON)
@@ -367,7 +489,7 @@ func createRequestBody(c *gin.Context, client cycletls.CycleTLS, cookie string, 
 		requestWebKnowledge = true
 		models = []string{openAIReq.Model}
 	}
-	if !lo.Contains(common.TextModelList, openAIReq.Model) {
+	if !common.IsTextModel(openAIReq.Model) {
 		models = common.MixtureModelList
 	}
 
@@ -563,9 +685,21 @@ func createImageRequestBody(c *gin.Context, cookie string, openAIReq *model.Open
 	}
 }
 
+type streamUsage struct {
+	promptTokens int
+}
+
+type streamEvent struct {
+	ID        string `json:"id"`
+	Type      string `json:"type"`
+	FieldName string `json:"field_name"`
+	FieldValue string `json:"field_value"`
+	Content   string `json:"content"`
+	Delta     string `json:"delta"`
+}
+
 // createStreamResponse 创建流式响应
-func createStreamResponse(responseId, modelName string, jsonData []byte, delta model.OpenAIDelta, finishReason *string) model.OpenAIChatCompletionResponse {
-	promptTokens := common.CountTokenText(string(jsonData), modelName)
+func createStreamResponse(responseId, modelName string, usage streamUsage, delta model.OpenAIDelta, finishReason *string) model.OpenAIChatCompletionResponse {
 	completionTokens := common.CountTokenText(delta.Content, modelName)
 	return model.OpenAIChatCompletionResponse{
 		ID:      responseId,
@@ -580,6 +714,79 @@ func createStreamResponse(responseId, modelName string, jsonData []byte, delta m
 			},
 		},
 		Usage: model.OpenAIUsage{
+			PromptTokens:     usage.promptTokens,
+			CompletionTokens: completionTokens,
+			TotalTokens:      usage.promptTokens + completionTokens,
+		},
+	}
+}
+
+func createToolCallStreamResponse(responseId, modelName string, usage streamUsage, toolCalls []model.OpenAIToolCall, finishReason *string) model.OpenAIChatCompletionResponse {
+	completionTokens := common.CountTokenText(fmt.Sprintf("%v", toolCalls), modelName)
+	return model.OpenAIChatCompletionResponse{
+		ID:      responseId,
+		Object:  "chat.completion.chunk",
+		Created: time.Now().Unix(),
+		Model:   modelName,
+		Choices: []model.OpenAIChoice{
+			{
+				Index: 0,
+				Delta: model.OpenAIDelta{
+					Role:      "assistant",
+					ToolCalls: toolCalls,
+				},
+				FinishReason: finishReason,
+			},
+		},
+		Usage: model.OpenAIUsage{
+			PromptTokens:     usage.promptTokens,
+			CompletionTokens: completionTokens,
+			TotalTokens:      usage.promptTokens + completionTokens,
+		},
+	}
+}
+
+func createFinalResponse(responseId, modelName string, jsonData []byte, content string, toolsRequested bool) model.OpenAIChatCompletionResponse {
+	promptTokens := common.CountTokenText(string(jsonData), modelName)
+	completionTokens := common.CountTokenText(content, modelName)
+	finishReason := "stop"
+	toolCalls, remainingContent, ok := extractToolCalls(content)
+	if toolsRequested && ok {
+		finishReason = "tool_calls"
+		return model.OpenAIChatCompletionResponse{
+			ID:      responseId,
+			Object:  "chat.completion",
+			Created: time.Now().Unix(),
+			Model:   modelName,
+			Choices: []model.OpenAIChoice{{
+				Message: model.OpenAIMessage{
+					Role:      "assistant",
+					Content:   remainingContent,
+					ToolCalls: toolCalls,
+				},
+				FinishReason: &finishReason,
+			}},
+			Usage: model.OpenAIUsage{
+				PromptTokens:     promptTokens,
+				CompletionTokens: completionTokens,
+				TotalTokens:      promptTokens + completionTokens,
+			},
+		}
+	}
+
+	return model.OpenAIChatCompletionResponse{
+		ID:      responseId,
+		Object:  "chat.completion",
+		Created: time.Now().Unix(),
+		Model:   modelName,
+		Choices: []model.OpenAIChoice{{
+			Message: model.OpenAIMessage{
+				Role:    "assistant",
+				Content: content,
+			},
+			FinishReason: &finishReason,
+		}},
+		Usage: model.OpenAIUsage{
 			PromptTokens:     promptTokens,
 			CompletionTokens: completionTokens,
 			TotalTokens:      promptTokens + completionTokens,
@@ -588,9 +795,9 @@ func createStreamResponse(responseId, modelName string, jsonData []byte, delta m
 }
 
 // handleMessageFieldDelta 处理消息字段增量
-func handleMessageFieldDelta(c *gin.Context, event map[string]interface{}, responseId, modelName string, jsonData []byte) error {
-	fieldName, ok := event["field_name"].(string)
-	if !ok {
+func handleMessageFieldDelta(c *gin.Context, event *streamEvent, responseId, modelName string, usage streamUsage) error {
+	fieldName := event.FieldName
+	if fieldName == "" {
 		return nil
 	}
 
@@ -611,13 +818,12 @@ func handleMessageFieldDelta(c *gin.Context, event map[string]interface{}, respo
 		return nil
 	}
 
-	// 获取 delta 内容
 	var delta string
 	switch {
 	case (modelName == "o1" || modelName == "o3-mini-high") && fieldName == "session_state.answer":
-		delta, _ = event["field_value"].(string)
+		delta = event.FieldValue
 	default:
-		delta, _ = event["delta"].(string)
+		delta = event.Delta
 	}
 
 	// 创建基础响应
@@ -625,7 +831,7 @@ func handleMessageFieldDelta(c *gin.Context, event map[string]interface{}, respo
 		return createStreamResponse(
 			responseId,
 			modelName,
-			jsonData,
+			usage,
 			model.OpenAIDelta{Content: content, Role: "assistant"},
 			nil,
 		)
@@ -654,14 +860,11 @@ type Content struct {
 	DetailAnswer string `json:"detailAnswer"`
 }
 
-func getDetailAnswer(eventMap map[string]interface{}) (string, error) {
-	// 获取 content 字段的值
-	contentStr, ok := eventMap["content"].(string)
-	if !ok {
+func getDetailAnswer(contentStr string) (string, error) {
+	if contentStr == "" {
 		return "", fmt.Errorf("content is not a string")
 	}
 
-	// 解析内层的 JSON
 	var content Content
 	if err := json.Unmarshal([]byte(contentStr), &content); err != nil {
 		return "", err
@@ -671,19 +874,48 @@ func getDetailAnswer(eventMap map[string]interface{}) (string, error) {
 }
 
 // handleMessageResult 处理消息结果
-func handleMessageResult(c *gin.Context, event map[string]interface{}, responseId, modelName string, jsonData []byte, searchModel bool) bool {
+func handleMessageResult(c *gin.Context, event *streamEvent, responseId, modelName string, usage streamUsage, searchModel bool, toolStreamingBuffer *strings.Builder, toolsRequested bool) bool {
 	finishReason := "stop"
 	var delta string
 	var err error
 	if modelName == "o1" && searchModel {
-		delta, err = getDetailAnswer(event)
+		delta, err = getDetailAnswer(event.Content)
 		if err != nil {
 			logger.Errorf(c.Request.Context(), "getDetailAnswer err: %v", err)
 			return false
 		}
 	}
 
-	streamResp := createStreamResponse(responseId, modelName, jsonData, model.OpenAIDelta{Content: delta, Role: "assistant"}, &finishReason)
+	if toolsRequested && toolStreamingBuffer != nil {
+		toolStreamingBuffer.WriteString(delta)
+		buffered := toolStreamingBuffer.String()
+		if toolCalls, _, ok := extractToolCalls(buffered); ok {
+			finishReason = "tool_calls"
+			streamResp := createToolCallStreamResponse(responseId, modelName, usage, toolCalls, &finishReason)
+			if err := sendSSEvent(c, streamResp); err != nil {
+				logger.Warnf(c.Request.Context(), "sendSSEvent err: %v", err)
+				return false
+			}
+			c.SSEvent("", " [DONE]")
+			return false
+		}
+		delta = buffered
+	}
+
+	if toolsRequested {
+		if toolCalls, _, ok := extractToolCalls(delta); ok {
+			finishReason = "tool_calls"
+			streamResp := createToolCallStreamResponse(responseId, modelName, usage, toolCalls, &finishReason)
+			if err := sendSSEvent(c, streamResp); err != nil {
+				logger.Warnf(c.Request.Context(), "sendSSEvent err: %v", err)
+				return false
+			}
+			c.SSEvent("", " [DONE]")
+			return false
+		}
+	}
+
+	streamResp := createStreamResponse(responseId, modelName, usage, model.OpenAIDelta{Content: delta, Role: "assistant"}, &finishReason)
 	if err := sendSSEvent(c, streamResp); err != nil {
 		logger.Warnf(c.Request.Context(), "sendSSEvent err: %v", err)
 		return false
@@ -859,7 +1091,7 @@ func makeUploadRequest(client cycletls.CycleTLS, uploadUrl string, fileBytes []b
 //	})
 //}
 
-func handleStreamRequest(c *gin.Context, client cycletls.CycleTLS, cookie string, cookieManager *config.CookieManager, requestBody map[string]interface{}, modelName string, searchModel bool) {
+func handleStreamRequest(c *gin.Context, client cycletls.CycleTLS, cookie string, cookieManager *config.CookieManager, requestBody map[string]interface{}, modelName string, searchModel bool, toolsRequested bool) {
 	const (
 		errNoValidCookies         = "No valid cookies available"
 		errCloudflareChallengeMsg = "Detected Cloudflare Challenge Page"
@@ -874,7 +1106,7 @@ func handleStreamRequest(c *gin.Context, client cycletls.CycleTLS, cookie string
 
 	responseId := fmt.Sprintf(responseIDFormat, time.Now().Format("20060102150405"))
 	ctx := c.Request.Context()
-	maxRetries := len(cookieManager.Cookies)
+	maxRetries := cookieManager.Len()
 
 	c.Stream(func(w io.Writer) bool {
 		for attempt := 0; attempt < maxRetries; attempt++ {
@@ -889,6 +1121,7 @@ func handleStreamRequest(c *gin.Context, client cycletls.CycleTLS, cookie string
 				c.JSON(500, gin.H{"error": "Failed to marshal request body"})
 				return false
 			}
+			usage := streamUsage{promptTokens: common.CountTokenText(string(jsonData), modelName)}
 			sseChan, err := makeStreamRequest(c, client, jsonData, cookie)
 			if err != nil {
 				logger.Errorf(ctx, "makeStreamRequest err on attempt %d: %v", attempt+1, err)
@@ -897,6 +1130,7 @@ func handleStreamRequest(c *gin.Context, client cycletls.CycleTLS, cookie string
 			}
 
 			var projectId string
+			var toolStreamingBuffer strings.Builder
 			isRateLimit := false
 		SSELoop:
 			for response := range sseChan {
@@ -950,7 +1184,7 @@ func handleStreamRequest(c *gin.Context, client cycletls.CycleTLS, cookie string
 				}
 
 				// 处理事件流数据
-				if shouldContinue := processStreamData(c, data, &projectId, cookie, responseId, modelName, jsonData, searchModel); !shouldContinue {
+				if shouldContinue := processStreamData(c, data, &projectId, cookie, responseId, modelName, usage, searchModel, &toolStreamingBuffer, toolsRequested); !shouldContinue {
 					return false
 				}
 			}
@@ -1054,7 +1288,7 @@ func cheat(requestBody map[string]interface{}, c *gin.Context, cookie string) (m
 }
 
 // 处理流式数据的辅助函数，返回bool表示是否继续处理
-func processStreamData(c *gin.Context, data string, projectId *string, cookie, responseId, model string, jsonData []byte, searchModel bool) bool {
+func processStreamData(c *gin.Context, data string, projectId *string, cookie, responseId, model string, usage streamUsage, searchModel bool, toolStreamingBuffer *strings.Builder, toolsRequested bool) bool {
 	data = strings.TrimSpace(data)
 	//if !strings.HasPrefix(data, "data: ") {
 	//	return true
@@ -1063,29 +1297,29 @@ func processStreamData(c *gin.Context, data string, projectId *string, cookie, r
 	if !strings.HasPrefix(data, "{\"id\":") && !strings.HasPrefix(data, "{\"message_id\":") {
 		return true
 	}
-	var event map[string]interface{}
+	var event streamEvent
 	if err := json.Unmarshal([]byte(data), &event); err != nil {
 		logger.Errorf(c.Request.Context(), "Failed to unmarshal event: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return false
 	}
 
-	eventType, ok := event["type"].(string)
-	if !ok {
+	eventType := event.Type
+	if eventType == "" {
 		return true
 	}
 
 	switch eventType {
 	case "project_start":
-		*projectId, _ = event["id"].(string)
+		*projectId = event.ID
 	case "message_field":
-		if err := handleMessageFieldDelta(c, event, responseId, model, jsonData); err != nil {
+		if err := handleMessageFieldDelta(c, &event, responseId, model, usage); err != nil {
 			logger.Errorf(c.Request.Context(), "handleMessageFieldDelta err: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return false
 		}
 	case "message_field_delta":
-		if err := handleMessageFieldDelta(c, event, responseId, model, jsonData); err != nil {
+		if err := handleMessageFieldDelta(c, &event, responseId, model, usage); err != nil {
 			logger.Errorf(c.Request.Context(), "handleMessageFieldDelta err: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return false
@@ -1104,7 +1338,7 @@ func processStreamData(c *gin.Context, data string, projectId *string, cookie, r
 			}
 		}()
 
-		return handleMessageResult(c, event, responseId, model, jsonData, searchModel)
+		return handleMessageResult(c, &event, responseId, model, usage, searchModel, toolStreamingBuffer, toolsRequested)
 	}
 
 	return true
@@ -1221,7 +1455,7 @@ func makeStreamRequest(c *gin.Context, client cycletls.CycleTLS, jsonData []byte
 //
 //		c.JSON(200, resp)
 //	}
-func handleNonStreamRequest(c *gin.Context, client cycletls.CycleTLS, cookie string, cookieManager *config.CookieManager, requestBody map[string]interface{}, modelName string, searchModel bool) {
+func handleNonStreamRequest(c *gin.Context, client cycletls.CycleTLS, cookie string, cookieManager *config.CookieManager, requestBody map[string]interface{}, modelName string, searchModel bool, toolsRequested bool) {
 	const (
 		errCloudflareChallengeMsg = "Detected Cloudflare Challenge Page"
 		errCloudflareBlock        = "CloudFlare: Sorry, you have been blocked"
@@ -1231,7 +1465,7 @@ func handleNonStreamRequest(c *gin.Context, client cycletls.CycleTLS, cookie str
 	)
 
 	ctx := c.Request.Context()
-	maxRetries := len(cookieManager.Cookies)
+	maxRetries := cookieManager.Len()
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		requestBody, err := cheat(requestBody, c, cookie)
@@ -1374,28 +1608,8 @@ func handleNonStreamRequest(c *gin.Context, client cycletls.CycleTLS, cookie str
 				logger.Warnf(ctx, firstLine)
 				//c.JSON(http.StatusInternalServerError, gin.H{"error": errNoValidResponseContent})
 			} else {
-				promptTokens := common.CountTokenText(string(jsonData), modelName)
-				completionTokens := common.CountTokenText(content, modelName)
-				finishReason := "stop"
-
-				c.JSON(http.StatusOK, model.OpenAIChatCompletionResponse{
-					ID:      fmt.Sprintf(responseIDFormat, time.Now().Format("20060102150405")),
-					Object:  "chat.completion",
-					Created: time.Now().Unix(),
-					Model:   modelName,
-					Choices: []model.OpenAIChoice{{
-						Message: model.OpenAIMessage{
-							Role:    "assistant",
-							Content: content,
-						},
-						FinishReason: &finishReason,
-					}},
-					Usage: model.OpenAIUsage{
-						PromptTokens:     promptTokens,
-						CompletionTokens: completionTokens,
-						TotalTokens:      promptTokens + completionTokens,
-					},
-				})
+				responseId := fmt.Sprintf(responseIDFormat, time.Now().Format("20060102150405"))
+				c.JSON(http.StatusOK, createFinalResponse(responseId, modelName, jsonData, content, toolsRequested))
 				return
 			}
 		}
