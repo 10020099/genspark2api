@@ -574,64 +574,6 @@ func preprocessToolMessages(openAIReq *model.OpenAIChatCompletionRequest) error 
 	return nil
 }
 
-func createLegacyRequestBody(c *gin.Context, client cycletls.CycleTLS, cookie string, openAIReq *model.OpenAIChatCompletionRequest) (map[string]interface{}, error) {
-	if err := preprocessToolMessages(openAIReq); err != nil {
-		return nil, fmt.Errorf("preprocessToolMessages err: %v", err)
-	}
-	openAIReq.SystemMessagesProcess(openAIReq.Model)
-	if config.PRE_MESSAGES_JSON != "" {
-		err := openAIReq.PrependMessagesFromJSON(config.PRE_MESSAGES_JSON)
-		if err != nil {
-			return nil, fmt.Errorf("PrependMessagesFromJSON err: %v PrependMessagesFromJSON:", err, config.PRE_MESSAGES_JSON)
-		}
-	}
-
-	// 处理消息中的图像 URL
-	err := processMessages(c, client, cookie, openAIReq.Messages)
-	if err != nil {
-		logger.Errorf(c.Request.Context(), "processMessages err: %v", err)
-		return nil, fmt.Errorf("processMessages err: %v", err)
-	}
-
-	currentQueryString := fmt.Sprintf("type=%s", chatType)
-	//查找 key 对应的 value
-	if chatId, ok := config.ModelChatMap[openAIReq.Model]; ok {
-		currentQueryString = fmt.Sprintf("id=%s&type=%s", chatId, chatType)
-	} else if chatId, ok := config.GlobalSessionManager.GetChatID(cookie, openAIReq.Model); ok {
-		currentQueryString = fmt.Sprintf("id=%s&type=%s", chatId, chatType)
-	} else {
-		openAIReq.FilterUserMessage()
-	}
-	requestWebKnowledge := false
-	models := []string{openAIReq.Model}
-	if strings.HasSuffix(openAIReq.Model, "-search") {
-		openAIReq.Model = strings.Replace(openAIReq.Model, "-search", "", 1)
-		requestWebKnowledge = true
-		models = []string{openAIReq.Model}
-	}
-	if !common.IsTextModel(openAIReq.Model) {
-		models = common.MixtureModelList
-	}
-
-	// 创建请求体
-	requestBody := map[string]interface{}{
-		"type":                 chatType,
-		"current_query_string": currentQueryString,
-		"messages":             openAIReq.Messages,
-		"action_params":        map[string]interface{}{},
-		"extra_data": map[string]interface{}{
-			"models":                 models,
-			"run_with_another_model": false,
-			"writingContent":         nil,
-			"request_web_knowledge":  requestWebKnowledge,
-		},
-	}
-
-	logger.Debug(c.Request.Context(), fmt.Sprintf("RequestBody: %v", requestBody))
-
-	return requestBody, nil
-}
-
 func createImageRequestBody(c *gin.Context, cookie string, openAIReq *model.OpenAIImagesGenerationRequest, chatId string) (map[string]interface{}, error) {
 
 	if openAIReq.Model == "dall-e-3" {
