@@ -837,7 +837,7 @@ func createFinalResponse(responseId, modelName string, jsonData []byte, content 
 	promptTokens := common.CountTokenText(string(jsonData), modelName)
 	completionTokens := common.CountTokenText(content, modelName)
 	finishReason := "stop"
-	toolCalls, remainingContent, ok := extractToolCalls(content)
+	toolCalls, _, ok := extractToolCalls(content)
 	if toolsRequested && ok {
 		finishReason = "tool_calls"
 		return model.OpenAIChatCompletionResponse{
