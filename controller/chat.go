@@ -859,35 +859,28 @@ func createFinalResponse(responseId, modelName string, jsonData []byte, content 
 // handleMessageFieldDelta 处理消息字段增量
 func handleMessageFieldDelta(c *gin.Context, event *streamEvent, responseId, modelName string, usage streamUsage) error {
 	fieldName := event.FieldName
-	if fieldName == "" {
+	if fieldName == "" || fieldName != "content" {
 		return nil
 	}
 
-	baseAllowed := fieldName == "content"
-	if !baseAllowed {
+	if event.Type != "message_field_delta" {
 		return nil
 	}
 
 	delta := event.Delta
 	if delta == "" {
-		delta = event.FieldValue
-	}
-
-	createResponse := func(content string) model.OpenAIChatCompletionResponse {
-		return createStreamResponse(
-			responseId,
-			modelName,
-			usage,
-			model.OpenAIDelta{Content: content, Role: "assistant"},
-			nil,
-		)
-	}
-
-	if delta == "" {
 		return nil
 	}
 
-	if err := sendSSEvent(c, createResponse(delta)); err != nil {
+	resp := createStreamResponse(
+		responseId,
+		modelName,
+		usage,
+		model.OpenAIDelta{Content: delta, Role: "assistant"},
+		nil,
+	)
+
+	if err := sendSSEvent(c, resp); err != nil {
 		return err
 	}
 
@@ -953,10 +946,12 @@ func handleMessageResult(c *gin.Context, event *streamEvent, responseId, modelNa
 		}
 	}
 
-	streamResp := createStreamResponse(responseId, modelName, usage, model.OpenAIDelta{Content: delta, Role: "assistant"}, &finishReason)
-	if err := sendSSEvent(c, streamResp); err != nil {
-		logger.Warnf(c.Request.Context(), "sendSSEvent err: %v", err)
-		return false
+	if strings.TrimSpace(delta) != "" {
+		streamResp := createStreamResponse(responseId, modelName, usage, model.OpenAIDelta{Content: delta, Role: "assistant"}, &finishReason)
+		if err := sendSSEvent(c, streamResp); err != nil {
+			logger.Warnf(c.Request.Context(), "sendSSEvent err: %v", err)
+			return false
+		}
 	}
 	c.SSEvent("", " [DONE]")
 	return false
