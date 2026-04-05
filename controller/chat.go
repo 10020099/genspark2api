@@ -27,14 +27,16 @@ const (
 var sharedDownloadClient = &http.Client{Timeout: 30 * time.Second}
 
 const (
-	baseURL          = "https://www.genspark.ai"
-	apiEndpoint      = baseURL + "/api/copilot/ask"
-	deleteEndpoint   = baseURL + "/api/project/delete?project_id=%s"
-	uploadEndpoint   = baseURL + "/api/get_upload_personal_image_url"
-	chatType         = "COPILOT_MOA_CHAT"
-	imageType        = "COPILOT_MOA_IMAGE"
-	videoType        = "COPILOT_MOA_VIDEO"
-	responseIDFormat = "chatcmpl-%s"
+	baseURL              = "https://www.genspark.ai"
+	chatAPIEndpoint      = baseURL + "/api/agent/ask_proxy"
+	copilotAPIEndpoint   = baseURL + "/api/copilot/ask"
+	deleteEndpoint       = baseURL + "/api/project/delete?project_id=%s"
+	uploadEndpoint       = baseURL + "/api/get_upload_personal_image_url"
+	imageType            = "COPILOT_MOA_IMAGE"
+	videoType            = "COPILOT_MOA_VIDEO"
+	responseIDFormat     = "chatcmpl-%s"
+	aiChatReferer        = baseURL + "/agents?type=ai_chat"
+	defaultAIChatModel   = "claude-4-5-haiku"
 )
 
 type OpenAIChatMessage struct {
@@ -179,7 +181,7 @@ func ChatForOpenAI(c *gin.Context) {
 		isSearchModel = true
 	}
 
-	requestBody, err := createRequestBody(c, client, cookie, &openAIReq)
+	requestBody, err := buildAIChatRequestBody(c, client, cookie, &openAIReq)
 
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
@@ -344,6 +346,124 @@ type parsedToolCall struct {
 	Arguments json.RawMessage `json:"arguments"`
 }
 
+type aiChatMessage struct {
+	Role         string                 `json:"role"`
+	ID           string                 `json:"id,omitempty"`
+	Content      interface{}            `json:"content"`
+	Thinking     bool                   `json:"thinking,omitempty"`
+	ProjectID    string                 `json:"project_id,omitempty"`
+	Action       interface{}            `json:"action,omitempty"`
+	RecommendActions interface{}        `json:"recommend_actions,omitempty"`
+	IsPrompt     bool                   `json:"is_prompt,omitempty"`
+	RenderTemplate interface{}          `json:"render_template,omitempty"`
+	SessionState map[string]interface{} `json:"session_state,omitempty"`
+	SystemReminder interface{}          `json:"system_reminder,omitempty"`
+	MessageType  interface{}            `json:"message_type,omitempty"`
+	ToolCalls    interface{}            `json:"tool_calls,omitempty"`
+	ToolCallID   interface{}            `json:"tool_call_id,omitempty"`
+	ThinkingBlocks interface{}          `json:"thinking_blocks,omitempty"`
+	ResponseID   interface{}            `json:"response_id,omitempty"`
+	ReasoningID  interface{}            `json:"reasoning_id,omitempty"`
+	ReasoningEncryptedContent interface{} `json:"reasoning_encrypted_content,omitempty"`
+	ReasoningContent interface{}        `json:"reasoning_content,omitempty"`
+	CogenID      interface{}            `json:"cogen_id,omitempty"`
+	CTime        interface{}            `json:"ctime,omitempty"`
+}
+
+func mapModelToAIChatModel(modelName string) string {
+	if strings.HasSuffix(modelName, "-search") {
+		modelName = strings.TrimSuffix(modelName, "-search")
+	}
+	return modelName
+}
+
+func randomMessageID() string {
+	return uuid.NewString()
+}
+
+func buildAIChatMessages(openAIReq *model.OpenAIChatCompletionRequest, projectID string) []map[string]interface{} {
+	messages := make([]map[string]interface{}, 0, len(openAIReq.Messages))
+	for _, message := range openAIReq.Messages {
+		msg := map[string]interface{}{
+			"role":    message.Role,
+			"content": message.Content,
+		}
+		if message.Role == "user" {
+			msg["id"] = randomMessageID()
+		}
+		if projectID != "" {
+			msg["project_id"] = projectID
+		}
+		messages = append(messages, msg)
+	}
+	return messages
+}
+
+func buildAIChatRequestBody(c *gin.Context, client cycletls.CycleTLS, cookie string, openAIReq *model.OpenAIChatCompletionRequest) (map[string]interface{}, error) {
+	if err := preprocessToolMessages(openAIReq); err != nil {
+		return nil, fmt.Errorf("preprocessToolMessages err: %v", err)
+	}
+	openAIReq.SystemMessagesProcess(openAIReq.Model)
+	if config.PRE_MESSAGES_JSON != "" {
+		err := openAIReq.PrependMessagesFromJSON(config.PRE_MESSAGES_JSON)
+		if err != nil {
+			return nil, fmt.Errorf("PrependMessagesFromJSON err: %v PrependMessagesFromJSON:", err, config.PRE_MESSAGES_JSON)
+		}
+	}
+	if err := processMessages(c, client, cookie, openAIReq.Messages); err != nil {
+		logger.Errorf(c.Request.Context(), "processMessages err: %v", err)
+		return nil, fmt.Errorf("processMessages err: %v", err)
+	}
+
+	projectID := ""
+	if chatID, ok := config.ModelChatMap[openAIReq.Model]; ok {
+		projectID = chatID
+	} else if chatID, ok := config.GlobalSessionManager.GetChatID(cookie, openAIReq.Model); ok {
+		projectID = chatID
+	}
+
+	requestWebKnowledge := false
+	modelName := mapModelToAIChatModel(openAIReq.Model)
+	if strings.HasSuffix(openAIReq.Model, "-search") {
+		requestWebKnowledge = true
+	}
+
+	messages := buildAIChatMessages(openAIReq, projectID)
+	userInput := ""
+	if userContent := openAIReq.GetUserContent(); len(userContent) > 0 {
+		userInput = userContent[0]
+	}
+
+	requestBody := map[string]interface{}{
+		"ai_chat_model":                  modelName,
+		"ai_chat_enable_search":          requestWebKnowledge,
+		"ai_chat_disable_personalization": false,
+		"use_moa_proxy":                  false,
+		"moa_models":                     []string{},
+		"writingContent":                 nil,
+		"type":                           "ai_chat",
+		"project_id":                     nil,
+		"messages":                       messages,
+		"user_s_input":                   userInput,
+		"is_private":                     true,
+		"push_token":                     "",
+	}
+
+	if projectID != "" {
+		requestBody["project_id"] = projectID
+	}
+
+	if len(messages) > 0 {
+		requestBody["session_state"] = map[string]interface{}{
+			"steps":    []interface{}{},
+			"messages": messages,
+		}
+	}
+
+	logger.Debug(c.Request.Context(), fmt.Sprintf("RequestBody: %v", requestBody))
+	return requestBody, nil
+}
+
 func buildToolSystemPrompt(tools []model.OpenAITool) (string, error) {
 	if len(tools) == 0 {
 		return "", nil
@@ -454,7 +574,7 @@ func preprocessToolMessages(openAIReq *model.OpenAIChatCompletionRequest) error 
 	return nil
 }
 
-func createRequestBody(c *gin.Context, client cycletls.CycleTLS, cookie string, openAIReq *model.OpenAIChatCompletionRequest) (map[string]interface{}, error) {
+func createLegacyRequestBody(c *gin.Context, client cycletls.CycleTLS, cookie string, openAIReq *model.OpenAIChatCompletionRequest) (map[string]interface{}, error) {
 	if err := preprocessToolMessages(openAIReq); err != nil {
 		return nil, fmt.Errorf("preprocessToolMessages err: %v", err)
 	}
@@ -801,32 +921,16 @@ func handleMessageFieldDelta(c *gin.Context, event *streamEvent, responseId, mod
 		return nil
 	}
 
-	// 基础允许列表（所有配置下都需要处理的字段）
-	baseAllowed := fieldName == "session_state.answer" ||
-		strings.Contains(fieldName, "session_state.streaming_detail_answer") ||
-		fieldName == "session_state.streaming_markmap"
-
-	// 需要显示思考过程时需要额外处理的字段
-	if config.ReasoningHide != 1 {
-		baseAllowed = baseAllowed ||
-			fieldName == "session_state.answerthink_is_started" ||
-			fieldName == "session_state.answerthink" ||
-			fieldName == "session_state.answerthink_is_finished"
-	}
-
+	baseAllowed := fieldName == "content"
 	if !baseAllowed {
 		return nil
 	}
 
-	var delta string
-	switch {
-	case (modelName == "o1" || modelName == "o3-mini-high") && fieldName == "session_state.answer":
+	delta := event.Delta
+	if delta == "" {
 		delta = event.FieldValue
-	default:
-		delta = event.Delta
 	}
 
-	// 创建基础响应
 	createResponse := func(content string) model.OpenAIChatCompletionResponse {
 		return createStreamResponse(
 			responseId,
@@ -837,23 +941,15 @@ func handleMessageFieldDelta(c *gin.Context, event *streamEvent, responseId, mod
 		)
 	}
 
-	// 发送基础事件
-	var err error
-	if err = sendSSEvent(c, createResponse(delta)); err != nil {
+	if delta == "" {
+		return nil
+	}
+
+	if err := sendSSEvent(c, createResponse(delta)); err != nil {
 		return err
 	}
 
-	// 处理思考过程标记
-	if config.ReasoningHide != 1 {
-		switch fieldName {
-		case "session_state.answerthink_is_started":
-			err = sendSSEvent(c, createResponse("<think>\n"))
-		case "session_state.answerthink_is_finished":
-			err = sendSSEvent(c, createResponse("\n</think>"))
-		}
-	}
-
-	return err
+	return nil
 }
 
 type Content struct {
@@ -943,7 +1039,7 @@ func makeRequest(client cycletls.CycleTLS, jsonData []byte, cookie string, isStr
 		accept = "text/event-stream"
 	}
 
-	return client.Do(apiEndpoint, cycletls.Options{
+	return client.Do(chatAPIEndpoint, cycletls.Options{
 		Timeout: 10 * 60 * 60,
 		Proxy:   config.ProxyUrl, // 在每个请求中设置代理
 		Body:    string(jsonData),
@@ -952,7 +1048,7 @@ func makeRequest(client cycletls.CycleTLS, jsonData []byte, cookie string, isStr
 			"Content-Type": "application/json",
 			"Accept":       accept,
 			"Origin":       baseURL,
-			"Referer":      baseURL + "/",
+			"Referer":      aiChatReferer,
 			"Cookie":       cookie,
 			"User-Agent":   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome",
 		},
@@ -964,7 +1060,7 @@ func makeImageRequest(client cycletls.CycleTLS, jsonData []byte, cookie string) 
 
 	accept := "*/*"
 
-	return client.Do(apiEndpoint, cycletls.Options{
+	return client.Do(copilotAPIEndpoint, cycletls.Options{
 		UserAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome",
 		Timeout:   10 * 60 * 60,
 		Proxy:     config.ProxyUrl, // 在每个请求中设置代理
@@ -1290,11 +1386,8 @@ func cheat(requestBody map[string]interface{}, c *gin.Context, cookie string) (m
 // 处理流式数据的辅助函数，返回bool表示是否继续处理
 func processStreamData(c *gin.Context, data string, projectId *string, cookie, responseId, model string, usage streamUsage, searchModel bool, toolStreamingBuffer *strings.Builder, toolsRequested bool) bool {
 	data = strings.TrimSpace(data)
-	//if !strings.HasPrefix(data, "data: ") {
-	//	return true
-	//}
 	data = strings.TrimPrefix(data, "data: ")
-	if !strings.HasPrefix(data, "{\"id\":") && !strings.HasPrefix(data, "{\"message_id\":") {
+	if !strings.HasPrefix(data, "{") {
 		return true
 	}
 	var event streamEvent
@@ -1326,15 +1419,12 @@ func processStreamData(c *gin.Context, data string, projectId *string, cookie, r
 		}
 	case "message_result":
 		go func() {
-			if config.AutoModelChatMapType == 1 {
-				// 保存映射
+			if config.AutoModelChatMapType == 1 && *projectId != "" {
 				config.GlobalSessionManager.AddSession(cookie, model, *projectId)
-			} else {
-				if config.AutoDelChat == 1 {
-					client := cycletls.Init()
-					defer safeClose(client)
-					makeDeleteRequest(client, cookie, *projectId)
-				}
+			} else if config.AutoDelChat == 1 && *projectId != "" {
+				client := cycletls.Init()
+				defer safeClose(client)
+				makeDeleteRequest(client, cookie, *projectId)
 			}
 		}()
 
@@ -1546,6 +1636,9 @@ func handleNonStreamRequest(c *gin.Context, client cycletls.CycleTLS, cookie str
 					Content   string `json:"content"`
 					Id        string `json:"id"`
 					Delta     string `json:"delta"`
+					Message   struct {
+						Content string `json:"content"`
+					} `json:"message"`
 				}
 				if err := json.Unmarshal([]byte(data), &parsedResponse); err != nil {
 					c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -1554,50 +1647,27 @@ func handleNonStreamRequest(c *gin.Context, client cycletls.CycleTLS, cookie str
 				if parsedResponse.Type == "project_start" {
 					projectId = parsedResponse.Id
 				}
-				if parsedResponse.Type == "message_field" {
-					// 提取思考过程
-					if config.ReasoningHide != 1 {
-						if parsedResponse.FieldName == "session_state.answerthink_is_started" {
-							answerThink = "<think>\n"
-						}
-						if parsedResponse.FieldName == "session_state.answerthink_is_finished" {
-							answerThink = answerThink + "\n</think>"
-						}
+				if parsedResponse.Type == "message_field" && parsedResponse.FieldName == "content" {
+					if parsedResponse.Content != "" {
+						content = strings.TrimSpace(parsedResponse.Content)
 					}
 				}
-				if parsedResponse.Type == "message_field_delta" {
-					// 提取思考过程
-					if config.ReasoningHide != 1 {
-						if parsedResponse.FieldName == "session_state.answerthink" {
-							answerThink = answerThink + parsedResponse.Delta
-						}
-					}
+				if parsedResponse.Type == "message_field_delta" && parsedResponse.FieldName == "content" {
+					content += parsedResponse.Delta
 				}
 				if parsedResponse.Type == "message_result" {
-					// 删除临时会话
 					go func() {
-						if config.AutoModelChatMapType == 1 {
-							// 保存映射
+						if config.AutoModelChatMapType == 1 && projectId != "" {
 							config.GlobalSessionManager.AddSession(cookie, modelName, projectId)
-						} else {
-							if config.AutoDelChat == 1 {
-								client := cycletls.Init()
-								defer safeClose(client)
-								makeDeleteRequest(client, cookie, projectId)
-							}
+						} else if config.AutoDelChat == 1 && projectId != "" {
+							client := cycletls.Init()
+							defer safeClose(client)
+							makeDeleteRequest(client, cookie, projectId)
 						}
 					}()
-					if modelName == "o1" && searchModel {
-						// 解析内层的 JSON
-						var content Content
-						if err := json.Unmarshal([]byte(parsedResponse.Content), &content); err != nil {
-							logger.Errorf(ctx, "Failed to unmarshal response content: %v err %s", parsedResponse.Content, err.Error())
-							c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to unmarshal response content"})
-							return
-						}
-						parsedResponse.Content = content.DetailAnswer
+					if parsedResponse.Message.Content != "" {
+						content = strings.TrimSpace(parsedResponse.Message.Content)
 					}
-					content = strings.TrimSpace(answerThink + parsedResponse.Content)
 					break
 				}
 			}
