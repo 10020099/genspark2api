@@ -367,7 +367,7 @@ func makeVideoRequest(client cycletls.CycleTLS, jsonData []byte, cookie string) 
 
 	accept := "*/*"
 
-	return client.Do(apiEndpoint, cycletls.Options{
+	return client.Do(copilotAPIEndpoint, cycletls.Options{
 		UserAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome",
 		Timeout:   10 * 60 * 60,
 		Proxy:     config.ProxyUrl, // 在每个请求中设置代理

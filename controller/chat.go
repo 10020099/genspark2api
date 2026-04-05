@@ -1297,12 +1297,14 @@ func handleStreamRequest(c *gin.Context, client cycletls.CycleTLS, cookie string
 				return false
 			}
 
-			// requestBody重制chatId
-			currentQueryString := fmt.Sprintf("type=%s", chatType)
-			if chatId, ok := config.GlobalSessionManager.GetChatID(cookie, modelName); ok {
-				currentQueryString = fmt.Sprintf("id=%s&type=%s", chatId, chatType)
+			// requestBody 重置 project_id
+			if chatId, ok := config.ModelChatMap[modelName]; ok {
+				requestBody["project_id"] = chatId
+			} else if chatId, ok := config.GlobalSessionManager.GetChatID(cookie, modelName); ok {
+				requestBody["project_id"] = chatId
+			} else {
+				requestBody["project_id"] = nil
 			}
-			requestBody["current_query_string"] = currentQueryString
 		}
 
 		logger.Errorf(ctx, "All cookies exhausted after %d attempts", maxRetries)
@@ -1445,7 +1447,7 @@ func makeStreamRequest(c *gin.Context, client cycletls.CycleTLS, jsonData []byte
 			"Content-Type": "application/json",
 			"Accept":       "text/event-stream",
 			"Origin":       baseURL,
-			"Referer":      baseURL + "/",
+			"Referer":      aiChatReferer,
 			"Cookie":       cookie,
 			"User-Agent":   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome",
 		},
@@ -1453,7 +1455,7 @@ func makeStreamRequest(c *gin.Context, client cycletls.CycleTLS, jsonData []byte
 
 	logger.Debug(c.Request.Context(), fmt.Sprintf("cookie: %v", cookie))
 
-	sseChan, err := client.DoSSE(apiEndpoint, options, "POST")
+	sseChan, err := client.DoSSE(chatAPIEndpoint, options, "POST")
 	if err != nil {
 		logger.Errorf(c, "Failed to make stream request: %v", err)
 		return nil, fmt.Errorf("Failed to make stream request: %v", err)
@@ -1551,7 +1553,6 @@ func handleNonStreamRequest(c *gin.Context, client cycletls.CycleTLS, cookie str
 		errCloudflareBlock        = "CloudFlare: Sorry, you have been blocked"
 		errServerErrMsg           = "An error occurred with the current request, please try again."
 		errServiceUnavailable     = "Genspark Service Unavailable"
-		errNoValidResponseContent = "No valid response content"
 	)
 
 	ctx := c.Request.Context()
@@ -1577,7 +1578,6 @@ func handleNonStreamRequest(c *gin.Context, client cycletls.CycleTLS, cookie str
 
 		scanner := bufio.NewScanner(strings.NewReader(response.Body))
 		var content string
-		var answerThink string
 		var firstLine string
 		var projectId string
 		isRateLimit := false
@@ -1689,12 +1689,14 @@ func handleNonStreamRequest(c *gin.Context, client cycletls.CycleTLS, cookie str
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "No more valid cookies available"})
 			return
 		}
-		// requestBody重制chatId
-		currentQueryString := fmt.Sprintf("type=%s", chatType)
-		if chatId, ok := config.GlobalSessionManager.GetChatID(cookie, modelName); ok {
-			currentQueryString = fmt.Sprintf("id=%s&type=%s", chatId, chatType)
+		// requestBody 重置 project_id
+		if chatId, ok := config.ModelChatMap[modelName]; ok {
+			requestBody["project_id"] = chatId
+		} else if chatId, ok := config.GlobalSessionManager.GetChatID(cookie, modelName); ok {
+			requestBody["project_id"] = chatId
+		} else {
+			requestBody["project_id"] = nil
 		}
-		requestBody["current_query_string"] = currentQueryString
 	}
 
 	logger.Errorf(ctx, "All cookies exhausted after %d attempts", maxRetries)
