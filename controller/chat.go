@@ -344,6 +344,11 @@ var toolCallPattern = regexp.MustCompile(`(?s)<tool_call>\s*(\{.*?\})\s*</tool_c
 type parsedToolCall struct {
 	Name      string          `json:"name"`
 	Arguments json.RawMessage `json:"arguments"`
+	Type      string          `json:"type,omitempty"`
+	Function  *struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	} `json:"function,omitempty"`
 }
 
 type aiChatMessage struct {
@@ -479,15 +484,17 @@ func buildToolSystemPrompt(tools []model.OpenAITool) (string, error) {
 Available tools:
 %s
 
-When a tool is needed, respond with one or more tool calls using exactly this XML-wrapped JSON format and no extra commentary:
+When a tool is needed, respond using ONLY one or more XML-wrapped JSON tool calls and nothing else:
 <tool_call>{"name":"tool_name","arguments":{"key":"value"}}</tool_call>
 
-Rules:
+Critical rules:
 1. The JSON inside each <tool_call> must be valid JSON.
 2. Use the exact tool name from the provided tools.
 3. Put all function arguments inside the arguments object.
-4. If no tool is needed, answer normally.
-5. If multiple tools are needed, output multiple <tool_call>...</tool_call> blocks.`, string(toolJSON))), nil
+4. If you output any <tool_call>, STOP immediately after the final </tool_call>.
+5. Do NOT add explanations, summaries, markdown, or pretend tool results after a <tool_call>.
+6. Only answer normally when no tool is needed.
+7. If multiple tools are needed, output multiple <tool_call>...</tool_call> blocks and nothing else.`, string(toolJSON))), nil
 }
 
 func normalizeToolArguments(raw json.RawMessage) string {
@@ -496,6 +503,10 @@ func normalizeToolArguments(raw json.RawMessage) string {
 		return "{}"
 	}
 	return trimmed
+}
+
+func containsToolCallMarker(content string) bool {
+	return strings.Contains(content, "<tool_call>") && strings.Contains(content, "</tool_call>")
 }
 
 func extractToolCalls(content string) ([]model.OpenAIToolCall, string, bool) {
@@ -512,11 +523,22 @@ func extractToolCalls(content string) ([]model.OpenAIToolCall, string, bool) {
 
 		var parsed parsedToolCall
 		if err := json.Unmarshal([]byte(match[1]), &parsed); err != nil {
-			return nil, strings.TrimSpace(content), false
+			continue
 		}
 
-		if strings.TrimSpace(parsed.Name) == "" {
-			return nil, strings.TrimSpace(content), false
+		name := strings.TrimSpace(parsed.Name)
+		arguments := parsed.Arguments
+		if parsed.Function != nil {
+			if name == "" {
+				name = strings.TrimSpace(parsed.Function.Name)
+			}
+			if len(arguments) == 0 {
+				arguments = parsed.Function.Arguments
+			}
+		}
+
+		if name == "" {
+			continue
 		}
 
 		toolIndex := index
@@ -525,8 +547,8 @@ func extractToolCalls(content string) ([]model.OpenAIToolCall, string, bool) {
 			ID:    "call_" + strings.ReplaceAll(uuid.NewString(), "-", ""),
 			Type:  "function",
 			Function: model.OpenAIToolCallFunction{
-				Name:      parsed.Name,
-				Arguments: normalizeToolArguments(parsed.Arguments),
+				Name:      name,
+				Arguments: normalizeToolArguments(arguments),
 			},
 		})
 	}
@@ -752,12 +774,15 @@ type streamUsage struct {
 }
 
 type streamEvent struct {
-	ID        string `json:"id"`
-	Type      string `json:"type"`
-	FieldName string `json:"field_name"`
+	ID         string `json:"id"`
+	Type       string `json:"type"`
+	FieldName  string `json:"field_name"`
 	FieldValue string `json:"field_value"`
-	Content   string `json:"content"`
-	Delta     string `json:"delta"`
+	Content    string `json:"content"`
+	Delta      string `json:"delta"`
+	Message    struct {
+		Content string `json:"content"`
+	} `json:"message"`
 }
 
 // createStreamResponse 创建流式响应
@@ -823,8 +848,29 @@ func createFinalResponse(responseId, modelName string, jsonData []byte, content 
 			Choices: []model.OpenAIChoice{{
 				Message: model.OpenAIMessage{
 					Role:      "assistant",
-					Content:   remainingContent,
+					Content:   "",
 					ToolCalls: toolCalls,
+				},
+				FinishReason: &finishReason,
+			}},
+			Usage: model.OpenAIUsage{
+				PromptTokens:     promptTokens,
+				CompletionTokens: completionTokens,
+				TotalTokens:      promptTokens + completionTokens,
+			},
+		}
+	}
+
+	if toolsRequested && containsToolCallMarker(content) {
+		return model.OpenAIChatCompletionResponse{
+			ID:      responseId,
+			Object:  "chat.completion",
+			Created: time.Now().Unix(),
+			Model:   modelName,
+			Choices: []model.OpenAIChoice{{
+				Message: model.OpenAIMessage{
+					Role:    "assistant",
+					Content: "",
 				},
 				FinishReason: &finishReason,
 			}},
@@ -918,9 +964,12 @@ func handleMessageResult(c *gin.Context, event *streamEvent, responseId, modelNa
 	}
 
 	if toolsRequested && toolStreamingBuffer != nil {
-		toolStreamingBuffer.WriteString(delta)
-		buffered := toolStreamingBuffer.String()
-		if toolCalls, _, ok := extractToolCalls(buffered); ok {
+		if toolStreamingBuffer.Len() > 0 {
+			delta = toolStreamingBuffer.String()
+		} else if event.Message.Content != "" {
+			delta = event.Message.Content
+		}
+		if toolCalls, _, ok := extractToolCalls(delta); ok {
 			finishReason = "tool_calls"
 			streamResp := createToolCallStreamResponse(responseId, modelName, usage, toolCalls, &finishReason)
 			if err := sendSSEvent(c, streamResp); err != nil {
@@ -930,7 +979,10 @@ func handleMessageResult(c *gin.Context, event *streamEvent, responseId, modelNa
 			c.SSEvent("", " [DONE]")
 			return false
 		}
-		delta = buffered
+		if containsToolCallMarker(delta) {
+			c.SSEvent("", " [DONE]")
+			return false
+		}
 	}
 
 	if toolsRequested {
@@ -1345,12 +1397,21 @@ func processStreamData(c *gin.Context, data string, projectId *string, cookie, r
 	case "project_start":
 		*projectId = event.ID
 	case "message_field":
+		if toolsRequested && event.FieldName == "content" {
+			break
+		}
 		if err := handleMessageFieldDelta(c, &event, responseId, model, usage); err != nil {
 			logger.Errorf(c.Request.Context(), "handleMessageFieldDelta err: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return false
 		}
 	case "message_field_delta":
+		if toolsRequested && event.FieldName == "content" {
+			if event.Delta != "" {
+				toolStreamingBuffer.WriteString(event.Delta)
+			}
+			break
+		}
 		if err := handleMessageFieldDelta(c, &event, responseId, model, usage); err != nil {
 			logger.Errorf(c.Request.Context(), "handleMessageFieldDelta err: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
